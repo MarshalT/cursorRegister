@@ -13,6 +13,7 @@ class QQEmailManager:
         self.email_address = None
         self.auth_code = None
         self.mail = None
+        self.last_verification_time = None  # 记录上次验证邮件时间戳
         
     def connect(self, email_address, auth_code):
         """连接QQ邮箱IMAP服务"""
@@ -23,12 +24,14 @@ class QQEmailManager:
             self.mail = imaplib.IMAP4_SSL(self.imap_server, self.imap_port)
             self.mail.login(self.email_address, self.auth_code)
             logger.debug(f"成功连接到QQ邮箱: {self.email_address}")
+            # 连接成功后立即清理验证邮件
+            self.delete_cursor_verification_emails(days=1)
             return True
         except Exception as e:
             logger.error(f"连接QQ邮箱失败: {str(e)}")
             return False
     
-    def get_cursor_verification_code(self, wait_time=120, check_interval=5, registration_email=None):
+    def get_cursor_verification_code(self, wait_time=120, check_interval=2, registration_email=None):
         """等待并获取Cursor验证码邮件
         
         Args:
@@ -50,221 +53,246 @@ class QQEmailManager:
         if registration_email and '@' in registration_email:
             email_username = registration_email.split('@')[0]
         
+        # 记录上次处理过的邮件ID，避免重复处理
+        processed_ids = set()
+        
+        # 获取搜索时间范围 - 仅搜索最近2分钟内的邮件，这对验证码邮件足够了
+        search_start_time = datetime.now() - timedelta(minutes=2)
+        search_date = search_start_time.strftime("%d-%b-%Y %H:%M:%S")
+        
+        # 记录搜索起始时间，用于日志
+        search_begin = datetime.now()
+        logger.debug(f"开始搜索验证码邮件，时间: {search_begin.strftime('%H:%M:%S')}")
+        
         while time.time() - start_time < wait_time:
             try:
-                # 选择收件箱
-                self.mail.select("INBOX")
+                # 选择收件箱，但不获取状态消息 (使用静默选择)
+                self.mail.select("INBOX", readonly=False)
                 
-                # 优先搜索最近邮件，缩短搜索时间范围
-                try:
-                    # 仅搜索前30秒内的新邮件，减少处理量
-                    minutes_ago = 1
-                    date_since = (datetime.now() - timedelta(minutes=minutes_ago)).strftime("%d-%b-%Y")
-                    search_criteria = f'(SINCE "{date_since}")'
-                    status, recent_messages = self.mail.search(None, search_criteria)
-                    
-                    if status != "OK" or not recent_messages[0]:
-                        # 如果没有找到最近邮件，直接返回搜索未读和Cursor邮件
-                        search_criteria = '(UNSEEN FROM "noreply@cursor.com" OR UNSEEN FROM "noreply@cursor.sh")'
-                        status, recent_messages = self.mail.search(None, search_criteria)
-                    
-                    if status == "OK" and recent_messages[0]:
-                        email_ids = recent_messages[0].split()
-                        # 从最新到最旧排序
-                        email_ids.reverse()
-                        # 只处理最新的3封邮件以提高速度
-                        email_ids = email_ids[:3]
-                        logger.debug(f"找到 {len(email_ids)} 封最近邮件，准备处理")
+                # 构建最精确的搜索条件 - 直接搜索未读的验证邮件
+                from_condition = '(FROM "cursor.sh" OR FROM "cursor.com")'  # 发件人条件
+                subject_condition = 'SUBJECT "Verify"'  # 主题条件
+                unseen_condition = 'UNSEEN'  # 未读条件
+                time_condition = f'SINCE "{search_date}"'  # 时间条件
+                
+                # 最优先搜索未读的验证邮件
+                search_query = f'{unseen_condition} {subject_condition} {from_condition}'
+                email_ids = self._search_emails(search_query)
+                
+                # 如果没找到，尝试搜索所有验证邮件（包括已读的）
+                if not email_ids:
+                    search_query = f'{subject_condition} {from_condition} {time_condition}'
+                    email_ids = self._search_emails(search_query)
+                
+                # 如果仍然没找到，等待后继续
+                if not email_ids:
+                    # 计算等待时间
+                    elapsed = (datetime.now() - search_begin).total_seconds()
+                    if elapsed > 30:  # 如果已经搜索超过30秒，使用更短的等待间隔
+                        actual_interval = min(check_interval, 2)
                     else:
-                        # 如果仍然没有找到，等待下一轮检查
-                        logger.debug(f"未找到任何符合条件的邮件，等待{check_interval}秒后重试...")
-                        time.sleep(check_interval)
-                        continue
-                except Exception as e:
-                    logger.debug(f"搜索邮件时出错: {str(e)}")
-                    time.sleep(check_interval)
+                        actual_interval = check_interval
+                    
+                    logger.debug(f"未找到验证码邮件，等待{actual_interval}秒后重试...")
+                    time.sleep(actual_interval)
                     continue
                 
-                # 处理找到的邮件
-                verification_code = None
+                # 限制处理的邮件数量 - 只处理最新的2封
+                email_ids = sorted(email_ids, reverse=True)[:2]
+                logger.debug(f"将处理最新的 {len(email_ids)} 封邮件")
                 
+                # 处理找到的邮件
                 for email_id in email_ids:
+                    # 跳过已处理过的邮件ID
+                    if email_id in processed_ids:
+                        continue
+                    processed_ids.add(email_id)
+                    
+                    # 快速检查邮件
                     try:
-                        # 获取邮件内容，使用快速获取方式
-                        status, msg_data = self.mail.fetch(email_id, '(BODY.PEEK[TEXT] BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])')
-                        if status != "OK":
-                            continue
+                        # 仅获取邮件头和正文的前4KB (足够提取验证码)
+                        fetch_query = '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)] BODY.PEEK[TEXT]<0.4096>)'
+                        status, msg_data = self.mail.fetch(email_id, fetch_query)
                         
-                        # 解析邮件头部信息
-                        header_data = msg_data[1][1]
-                        msg_headers = email.message_from_bytes(header_data)
-                        
-                        # 获取发件人
-                        from_addr = msg_headers.get("From", "")
-                        
-                        # 获取主题
-                        subject = decode_header(msg_headers.get("Subject", ""))[0][0]
-                        if isinstance(subject, bytes):
-                            subject = subject.decode()
-                        
-                        # 快速检查是否是Cursor邮件
-                        if ("cursor" not in from_addr.lower() and 
-                            "cursor" not in subject.lower() and 
-                            "verify" not in subject.lower()):
+                        if status != "OK" or not msg_data or len(msg_data) < 2:
+                            logger.debug(f"无法获取邮件 {email_id} 内容")
                             continue
                             
-                        logger.debug(f"找到可能的验证码邮件: 来自 {from_addr}, 主题: {subject}")
+                        # 解析邮件头
+                        header_data = msg_data[0][1]
+                        header_str = header_data.decode('utf-8', errors='ignore').lower()
                         
-                        # 获取邮件正文
-                        body_data = msg_data[0][1]
-                        body = ""
-                        
-                        try:
-                            if isinstance(body_data, bytes):
-                                # 尝试各种编码
-                                for encoding in ['utf-8', 'latin-1', 'ascii']:
-                                    try:
-                                        body = body_data.decode(encoding)
-                                        break
-                                    except:
-                                        continue
-                        except:
-                            # 如果简单方法失败，使用完整解析
-                            try:
-                                status, full_msg_data = self.mail.fetch(email_id, '(RFC822)')
-                                if status == "OK":
-                                    msg = email.message_from_bytes(full_msg_data[0][1])
-                                    if msg.is_multipart():
-                                        for part in msg.walk():
-                                            content_type = part.get_content_type()
-                                            if content_type == "text/plain" or content_type == "text/html":
-                                                try:
-                                                    payload = part.get_payload(decode=True)
-                                                    if payload:
-                                                        charset = part.get_content_charset() or 'utf-8'
-                                                        body = payload.decode(charset, errors='replace')
-                                                        break
-                                                except:
-                                                    continue
-                                    else:
-                                        try:
-                                            payload = msg.get_payload(decode=True)
-                                            if payload:
-                                                charset = msg.get_content_charset() or 'utf-8'
-                                                body = payload.decode(charset, errors='replace')
-                                        except:
-                                            pass
-                            except:
-                                # 如果还是失败，跳过此邮件
-                                continue
-                        
-                        # 检查邮件正文长度
-                        if not body:
+                        # 快速检查是否为验证邮件
+                        if 'cursor' not in header_str or 'verify' not in header_str:
+                            logger.debug(f"邮件 {email_id} 不是验证邮件，跳过")
                             continue
-                            
-                        logger.debug(f"邮件内容长度: {len(body)} 字符")
                         
-                        # 如果有注册邮箱，快速检查邮件是否包含该邮箱
+                        # 获取正文
+                        body_data = msg_data[1][1]
+                        body = body_data.decode('utf-8', errors='ignore')
+                        
+                        # 如果指定了注册邮箱，先检查邮件内容是否包含该邮箱
                         if registration_email and registration_email not in body and email_username not in body:
+                            logger.debug(f"邮件 {email_id} 不包含注册邮箱 {registration_email}，跳过")
                             continue
+                        
+                        # 快速提取验证码 - 直接使用优化版的提取算法
+                        code = self._extract_verification_code(body)
+                        if code:
+                            # 处理成功提取验证码的情况
+                            self._mark_and_delete_email(email_id)
+                            logger.info(f"成功提取Cursor验证码: {code}")
+                            return code
                             
-                        # 提取验证码 - 直接使用简单匹配，避免复杂正则表达式
-                        verification_code = self._fast_extract_code(body)
-                        if verification_code:
-                            # 将邮件标记为已读
-                            self.mail.store(email_id, '+FLAGS', '\\Seen')
-                            logger.info(f"成功提取Cursor验证码: {verification_code}")
-                            return verification_code
                     except Exception as e:
-                        logger.debug(f"处理邮件出错: {str(e)}")
+                        logger.debug(f"处理邮件 {email_id} 出错: {e}")
                         continue
                 
-                # 如果处理完所有邮件但没找到验证码，等待并重试
-                logger.debug(f"未找到验证码，等待{check_interval}秒后重试...")
+                # 如果本轮没找到验证码，等待后继续
+                logger.debug(f"本轮未找到验证码，等待{check_interval}秒后重试...")
                 time.sleep(check_interval)
             
             except Exception as e:
-                logger.error(f"获取验证码过程出错: {str(e)}")
+                logger.error(f"获取验证码过程出错: {e}")
                 time.sleep(check_interval)
         
-        logger.error(f"等待超时({wait_time}秒)，未收到或无法解析Cursor验证码邮件")
+        logger.error(f"等待超时({wait_time}秒)，未找到验证码")
         return None
     
-    def _fast_extract_code(self, email_content):
-        """快速从邮件内容中提取6位数字验证码"""
-        if not email_content:
-            return None
+    def _search_emails(self, search_query):
+        """搜索符合条件的邮件
+        
+        Args:
+            search_query: 搜索条件
             
-        # 1. 尝试查找特定格式 "Enter the code below" 后的6位数字
+        Returns:
+            邮件ID列表
+        """
         try:
-            code_match = re.search(r'Enter the code below[^0-9]*(\d{6})', email_content, re.IGNORECASE)
-            if code_match:
-                return code_match.group(1)
-        except:
-            pass
+            # 执行搜索
+            status, messages = self.mail.search(None, search_query)
+            if status != "OK" or not messages[0]:
+                return []
+                
+            # 获取邮件ID列表
+            email_ids = messages[0].split()
+            query_display = search_query.replace('(', '').replace(')', '')
+            logger.debug(f"搜索条件「{query_display}」找到 {len(email_ids)} 封邮件")
+            return email_ids
+        except Exception as e:
+            logger.debug(f"搜索邮件失败: {e}")
+            return []
+    
+    def _extract_verification_code(self, body):
+        """从邮件内容中提取验证码
+        
+        Args:
+            body: 邮件正文
             
-        # 2. 查找行内孤立的6位数字 - 最常见的验证码格式
+        Returns:
+            验证码字符串，如果未找到则返回None
+        """
         try:
-            for line in email_content.splitlines():
+            # 方法1: 行扫描 - 寻找单独一行的6位数字
+            for line in body.splitlines():
                 line = line.strip()
                 if re.match(r'^\d{6}$', line):
                     return line
-        except:
-            pass
-        
-        # 3. 最后尝试找任何6位数字
-        try:
-            matches = re.findall(r'\D(\d{6})\D', ' ' + email_content + ' ')
-            if matches:
-                return matches[0]
-        except:
-            pass
             
-        return None
-        
-    def extract_verification_code(self, email_content):
-        """从邮件内容中提取验证码（完整版本，仅作为备用）"""
-        if not email_content:
+            # 方法2: 关键词匹配
+            match = re.search(r'Enter the code below[^0-9]*(\d{6})', body, re.IGNORECASE)
+            if match:
+                return match.group(1)
+                
+            # 方法3: 通用匹配 - 查找被非数字字符包围的6位数字
+            match = re.search(r'[^0-9](\d{6})[^0-9]', " " + body + " ")
+            if match:
+                return match.group(1)
+                
             return None
+        except Exception as e:
+            logger.debug(f"提取验证码失败: {e}")
+            return None
+    
+    def _mark_and_delete_email(self, email_id):
+        """标记并删除指定的邮件
         
-        # 尝试快速提取方法
-        code = self._fast_extract_code(email_content)
-        if code:
-            return code
+        Args:
+            email_id: 邮件ID
+        """
+        try:
+            # 标记为已读
+            self.mail.store(email_id, '+FLAGS', '\\Seen')
             
-        # 如果快速方法失败，尝试更多模式
-        patterns = [
-            r'\n\s*(\d{6})\s*\n',
-            r'验证码[：:]?\s*?(\d{6})',
-            r'verification code[：:]*\s*(\d{6})',
-            r'code[：:]?\s*?(\d{6})',
-            r'<strong>(\d{6})</strong>',
-            r'<b>(\d{6})</b>',
-            r'(\d{6})'
-        ]
+            # 标记为删除并执行删除
+            self.mail.store(email_id, '+FLAGS', '\\Deleted')
+            self.mail.expunge()
+            logger.debug(f"已删除验证码邮件 {email_id}")
+        except Exception as e:
+            logger.debug(f"标记/删除邮件失败: {e}")
         
-        for pattern in patterns:
-            try:
-                match = re.search(pattern, email_content, re.IGNORECASE | re.DOTALL)
-                if match:
-                    return match.group(1)
-            except:
-                continue
+    def delete_cursor_verification_emails(self, days=7):
+        """删除指定天数内的所有Cursor验证邮件
         
-        return None
+        Args:
+            days: 要删除的邮件天数范围
         
+        Returns:
+            已删除的邮件数量
+        """
+        try:
+            # 选择收件箱
+            self.mail.select("INBOX")
+            
+            # 构建搜索条件 - 查找所有来自cursor的验证邮件
+            days_ago = (datetime.now() - timedelta(days=days)).strftime("%d-%b-%Y")
+            search_criteria = f'(FROM "cursor.sh" OR FROM "cursor.com") SUBJECT "Verify" SINCE "{days_ago}"'
+            
+            # 搜索邮件
+            status, messages = self.mail.search(None, search_criteria)
+            if status != "OK" or not messages[0]:
+                logger.debug("未找到需要删除的验证邮件")
+                return 0
+                
+            # 获取邮件ID
+            email_ids = messages[0].split()
+            count = len(email_ids)
+            
+            if count > 0:
+                logger.debug(f"找到 {count} 封需要删除的验证邮件")
+                
+                # 批量标记删除
+                for email_id in email_ids:
+                    self.mail.store(email_id, '+FLAGS', '\\Deleted')
+                
+                # 执行删除操作
+                self.mail.expunge()
+                logger.info(f"成功删除 {count} 封验证邮件")
+                return count
+            
+            return 0
+        except Exception as e:
+            logger.error(f"删除验证邮件失败: {e}")
+            return 0
+    
     def disconnect(self):
         """断开连接"""
         if self.mail:
             try:
+                # 确保在断开连接前执行所有待删除的邮件删除操作
+                try:
+                    self.mail.expunge()
+                except:
+                    pass
+                
                 self.mail.close()
                 self.mail.logout()
                 logger.debug("已断开QQ邮箱连接")
             except Exception as e:
-                logger.error(f"断开连接时出错: {str(e)}")
+                logger.error(f"断开连接时出错: {e}")
 
+# 单独测试
 if __name__ == "__main__":
-    # 简单测试代码
     import os
     from dotenv import load_dotenv
     
@@ -286,14 +314,29 @@ if __name__ == "__main__":
     if manager.connect(qq_email, qq_auth_code):
         print(f"成功连接到QQ邮箱: {qq_email}")
         
-        # 获取验证码
-        print("开始获取验证码，等待中...")
-        code = manager.get_cursor_verification_code(wait_time=60, check_interval=5)
+        # 询问是否清理历史验证邮件
+        clean_history = input("是否要清理历史验证邮件？(y/n): ").lower() == 'y'
+        if clean_history:
+            days = int(input("要删除多少天内的验证邮件？(默认7天): ") or "7")
+            deleted = manager.delete_cursor_verification_emails(days)
+            if deleted:
+                print(f"已删除 {deleted} 封历史验证邮件")
         
-        if code:
-            print(f"成功获取验证码: {code}")
-        else:
-            print("未能获取验证码")
+        # 获取验证码
+        code_test = input("是否要测试获取验证码？(y/n): ").lower() == 'y'
+        if code_test:
+            test_email = input("输入测试邮箱地址(用于过滤)或直接回车: ")
+            print("开始获取验证码，等待中...")
+            code = manager.get_cursor_verification_code(
+                wait_time=60, 
+                check_interval=3, 
+                registration_email=test_email if test_email else None
+            )
+            
+            if code:
+                print(f"成功获取验证码: {code}")
+            else:
+                print("未能获取验证码")
         
         # 断开连接
         manager.disconnect()

@@ -37,12 +37,15 @@ class ManageTab(ttk.Frame):
     def setup_ui(self):
         accounts_frame = UI.create_labeled_frame(self, "已保存账号")
 
-        columns = ('域名', '邮箱', '额度', '剩余天数')
+        columns = ('序号', '域名', '邮箱', '额度', '剩余天数')
         tree = ttk.Treeview(accounts_frame, columns=columns, show='headings', height=TREE_VIEW_HEIGHT)
 
         for col in columns:
             tree.heading(col, text=col)
             tree.column(col, width=COLUMN_WIDTH)
+        
+        # 设置序号列为较窄的宽度
+        tree.column('序号', width=40, stretch=False)
 
         tree.bind('<<TreeviewSelect>>', self.on_select)
 
@@ -156,9 +159,10 @@ class ManageTab(ttk.Frame):
 
         try:
             csv_files = self.get_csv_files()
-            for csv_file in csv_files:
+            for i, csv_file in enumerate(csv_files, 1):
                 account_data = self.parse_csv_file(csv_file)
                 self.account_tree.insert('', 'end', iid=csv_file, values=(
+                    i,  # 显示序号
                     account_data['DOMAIN'],
                     account_data['EMAIL'],
                     account_data['QUOTA'],
