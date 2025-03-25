@@ -20,6 +20,7 @@ from typing import Dict, List, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor
 import base64
 import json
+import time
 
 import requests
 from loguru import logger
@@ -364,7 +365,53 @@ class ManageTab(ttk.Frame):
                     if not result.success:
                         raise ValueError(result.message)
 
-                    UI.show_success(self.winfo_toplevel(), f"账号 {email} 的Cookie已刷新")
+                    def restart_cursor():
+                        try:
+                            self.winfo_toplevel().after(0, lambda: UI.show_loading(
+                                self.winfo_toplevel(),
+                                "正在重启Cursor",
+                                "关闭并重启Cursor编辑器..."
+                            ))
+                            
+                            # 关闭Cursor进程
+                            logger.debug("开始关闭Cursor进程")
+                            kill_result = Utils.kill_process(['Cursor', 'cursor'])
+                            if not kill_result.success:
+                                logger.warning(f"关闭Cursor进程失败: {kill_result.message}")
+                            
+                            # 等待进程完全关闭
+                            logger.debug("等待Cursor进程完全关闭")
+                            time.sleep(3)  # 增加等待时间确保进程完全关闭
+                            
+                            # 启动Cursor
+                            logger.debug("开始启动Cursor")
+                            start_result = Utils.start_cursor()
+                            
+                            # 给Cursor启动一些时间
+                            time.sleep(1)
+                            
+                            self.winfo_toplevel().after(0, lambda: UI.close_loading(self.winfo_toplevel()))
+                            
+                            if not start_result.success:
+                                logger.warning(f"启动Cursor失败: {start_result.message}")
+                                self.winfo_toplevel().after(0, lambda: UI.show_warning(
+                                    self.winfo_toplevel(),
+                                    "Cursor账号已更换，但自动启动Cursor失败，请手动打开Cursor。"
+                                ))
+                            else:
+                                self.winfo_toplevel().after(0, lambda: UI.show_success(
+                                    self.winfo_toplevel(),
+                                    f"账号 {email} 的Cookie已刷新并重启Cursor"
+                                ))
+                        except Exception as e:
+                            self.winfo_toplevel().after(0, lambda: UI.close_loading(self.winfo_toplevel()))
+                            logger.error(f"重启Cursor失败: {e}")
+                            self.winfo_toplevel().after(0, lambda: UI.show_warning(
+                                self.winfo_toplevel(),
+                                f"账号 {email} 的Cookie已刷新，但重启Cursor失败: {str(e)}"
+                            ))
+                    
+                    threading.Thread(target=restart_cursor, daemon=True).start()
                     logger.info(f"已刷新账号 {email} 的Cookie")
                 except Exception as e:
                     self.winfo_toplevel().after(0, lambda: UI.close_loading(self.winfo_toplevel()))

@@ -236,6 +236,50 @@ class Utils:
             return Result.fail(f"结束进程失败: {e}")
 
     @staticmethod
+    def start_cursor() -> Result[None]:
+        try:
+            # 从系统变量PATH中查找cursor.exe
+            cursor_path = None
+            for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+                possible_path = os.path.join(path_dir, "cursor.exe")
+                if os.path.exists(possible_path):
+                    cursor_path = possible_path
+                    break
+                    
+            # 如果PATH中没有，尝试常见安装位置
+            if not cursor_path:
+                common_paths = [
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Cursor", "Cursor.exe"),
+                    os.path.join(os.environ.get("PROGRAMFILES", ""), "Cursor", "Cursor.exe"),
+                    os.path.join(os.environ.get("PROGRAMFILES(X86)", ""), "Cursor", "Cursor.exe")
+                ]
+                for path in common_paths:
+                    if os.path.exists(path):
+                        cursor_path = path
+                        break
+                        
+            if not cursor_path:
+                return Result.fail("找不到Cursor可执行文件")
+            
+            logger.debug(f"找到Cursor可执行文件路径: {cursor_path}")
+                
+            # 使用startfile直接启动应用程序
+            try:
+                # 首先尝试使用startfile (更可靠的Windows方式)
+                os.startfile(cursor_path)
+                logger.debug("使用startfile成功启动Cursor")
+                return Result.ok(message="Cursor已启动")
+            except Exception as start_err:
+                logger.warning(f"使用startfile启动失败: {start_err}，尝试使用subprocess")
+                # 备用方法：subprocess启动
+                subprocess.Popen(cursor_path, shell=True, creationflags=subprocess.CREATE_NEW_CONSOLE)
+                logger.debug("使用subprocess成功启动Cursor")
+                return Result.ok(message="Cursor已启动")
+        except Exception as e:
+            logger.error(f"启动Cursor失败: {e}")
+            return Result.fail(f"启动Cursor失败: {e}")
+
+    @staticmethod
     def run_as_admin() -> bool:
         try:
             if ctypes.windll.shell32.IsUserAnAdmin():
