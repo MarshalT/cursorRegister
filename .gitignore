@@ -1,3 +1,4 @@
+*.pyc
 /.env
 /cursorRegister_log
 /.idea

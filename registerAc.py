@@ -9,6 +9,7 @@ from loguru import logger
 
 from utils import MoemailManager
 from utils import Utils
+from qq_email_manager import QQEmailManager
 
 
 class CursorRegistration:
@@ -36,6 +37,16 @@ class CursorRegistration:
         self.retry_times = 5
         self.browser = self.tab = self.moe = None
         self.admin = False
+        # QQ邮箱配置
+        self.qq_email_manager = None
+        self.qq_email = os.getenv('QQ_EMAIL')
+        self.qq_auth_code = os.getenv('QQ_AUTH_CODE')
+        self.use_qq_email = False
+        if self.qq_email and self.qq_auth_code:
+            self.use_qq_email = True
+            logger.info("将使用QQ邮箱获取验证码")
+        else:
+            logger.info("未配置QQ邮箱，将使用临时邮箱获取验证码")
 
     def _safe_action(self, action, *args, **kwargs):
         try:
@@ -229,10 +240,47 @@ class CursorRegistration:
                 self.browser.quit()
 
     def admin_auto_register(self, wait_callback=None):
-        self.moe = MoemailManager()
-        email_info = self.moe.create_email(email=self.email)
-        logger.debug(f"已创建邮箱 ： {email_info.data.get('email')}")
+        # 初始化临时邮箱或QQ邮箱
         self.admin = True
+        
+        # 先检查QQ邮箱是否可用
+        if self.use_qq_email:
+            self.qq_email_manager = QQEmailManager()
+            connection_result = self.qq_email_manager.connect(self.qq_email, self.qq_auth_code)
+            if not connection_result:
+                logger.error("QQ邮箱连接失败，将回退使用临时邮箱获取验证码")
+                self.use_qq_email = False
+            else:
+                logger.info("成功连接到QQ邮箱")
+        
+        # 只有在QQ邮箱不可用或未配置QQ邮箱时才初始化临时邮箱
+        if not self.use_qq_email:
+            # 检查临时邮箱必需的环境变量
+            api_key = os.getenv("API_KEY")
+            moe_mail_url = os.getenv("MOE_MAIL_URL")
+            
+            missing_vars = []
+            if not api_key:
+                missing_vars.append("API_KEY")
+            if not moe_mail_url:
+                missing_vars.append("MOE_MAIL_URL")
+            
+            if missing_vars:
+                error_msg = f"缺少必需的环境变量: {', '.join(missing_vars)}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            try:
+                self.moe = MoemailManager()
+                email_info = self.moe.create_email(email=self.email)
+                logger.debug(f"已创建邮箱 ： {email_info.data.get('email')}")
+            except Exception as e:
+                logger.error(f"初始化临时邮箱失败: {str(e)}")
+                raise
+        else:
+            # 使用QQ邮箱模式，不需要初始化临时邮箱
+            logger.debug(f"使用QQ邮箱模式，跳过临时邮箱初始化")
+        
         token = self._safe_action(self.auto_register, wait_callback)
         if token:
             env_updates = {
@@ -241,6 +289,11 @@ class CursorRegistration:
                 "PASSWORD": self.password
             }
             Utils.update_env_vars(env_updates)
+            
+        # 断开QQ邮箱连接
+        if self.use_qq_email and self.qq_email_manager:
+            self.qq_email_manager.disconnect()
+            
         return token
 
     def _cursor_turnstile(self):
@@ -273,6 +326,63 @@ class CursorRegistration:
         return False
 
     def get_email_data(self):
+        # 优先使用QQ邮箱获取验证码
+        if self.use_qq_email and self.qq_email_manager:
+            logger.debug("使用QQ邮箱获取验证码")
+            for retry in range(self.retry_times):
+                try:
+                    logger.debug(f"尝试从QQ邮箱获取Cursor验证码，第 {retry + 1} 次尝试")
+                    verification_code = self.qq_email_manager.get_cursor_verification_code(
+                        wait_time=120, 
+                        check_interval=5, 
+                        registration_email=self.email  # 传入当前注册邮箱
+                    )
+                    if verification_code:
+                        # 构造一个与临时邮箱服务返回格式一致的数据结构，方便后续解析
+                        email_data = {
+                            'message': {
+                                'content': f"\n{verification_code}\n",  # 格式化为现有代码能识别的格式
+                                'subject': 'Cursor Email Verification',
+                                'from': 'noreply@cursor.com'
+                            }
+                        }
+                        logger.debug("成功从QQ邮箱获取验证码")
+                        return email_data
+                except Exception as e:
+                    logger.error(f"从QQ邮箱获取验证码时出错 (第 {retry + 1} 次尝试): {str(e)}")
+                    if retry == self.retry_times - 1:
+                        logger.error(f"已达到最大重试次数 {self.retry_times}，QQ邮箱获取验证码失败")
+                        # 失败后尝试使用临时邮箱
+                        logger.info("尝试回退使用临时邮箱获取验证码")
+                        break
+                time.sleep(2)
+        
+        # 使用临时邮箱获取验证码
+        # 检查临时邮箱是否已初始化
+        if not self.moe:
+            # 检查临时邮箱必需的环境变量
+            api_key = os.getenv("API_KEY")
+            moe_mail_url = os.getenv("MOE_MAIL_URL")
+            
+            missing_vars = []
+            if not api_key:
+                missing_vars.append("API_KEY")
+            if not moe_mail_url:
+                missing_vars.append("MOE_MAIL_URL")
+            
+            if missing_vars:
+                error_msg = f"缺少必需的环境变量: {', '.join(missing_vars)}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+                
+            # 初始化临时邮箱
+            try:
+                self.moe = MoemailManager()
+            except Exception as e:
+                logger.error(f"初始化临时邮箱失败: {str(e)}")
+                raise
+        
+        logger.debug("使用临时邮箱获取验证码")
         for retry in range(self.retry_times):
             try:
                 logger.debug(f"尝试获取最新邮件，第 {retry + 1} 次尝试")
