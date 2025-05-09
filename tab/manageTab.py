@@ -25,8 +25,104 @@ import time
 import requests
 from loguru import logger
 
-from utils import CursorManager, error_handler,Utils
+from utils import CursorManager, error_handler, Utils
 from .ui import UI
+
+# 添加剪贴板支持
+try:
+    import pyperclip
+    has_pyperclip = True
+except ImportError:
+    logger.warning("未安装pyperclip模块，将尝试使用系统剪贴板，建议执行：pip install pyperclip")
+    has_pyperclip = False
+    
+    # 尝试使用系统特定的剪贴板方法
+    import platform
+    
+    if platform.system() == 'Windows':
+        try:
+            import ctypes
+            
+            # Windows 剪贴板处理
+            CF_UNICODETEXT = 13
+            
+            def windows_copy_clipboard(text):
+                ctypes.windll.user32.OpenClipboard(0)
+                ctypes.windll.user32.EmptyClipboard()
+                
+                text_bytes = text.encode('utf-16le')
+                hCd = ctypes.windll.kernel32.GlobalAlloc(0x0002, len(text_bytes) + 2)
+                pchData = ctypes.windll.kernel32.GlobalLock(hCd)
+                ctypes.cdll.msvcrt.memcpy(ctypes.c_void_p(pchData), text_bytes, len(text_bytes))
+                ctypes.windll.kernel32.GlobalUnlock(hCd)
+                ctypes.windll.user32.SetClipboardData(CF_UNICODETEXT, hCd)
+                ctypes.windll.user32.CloseClipboard()
+                
+            pyperclip = type('PyperclipAlternative', (), {'copy': staticmethod(windows_copy_clipboard)})
+            has_pyperclip = True
+            logger.info("已启用Windows系统剪贴板支持")
+        except Exception as e:
+            logger.error(f"初始化Windows剪贴板失败: {e}")
+    
+    elif platform.system() == 'Darwin':  # macOS
+        try:
+            def macos_copy_clipboard(text):
+                import subprocess
+                process = subprocess.Popen(
+                    ['pbcopy'], 
+                    stdin=subprocess.PIPE, 
+                    close_fds=True
+                )
+                process.communicate(input=text.encode('utf-8'))
+                
+            pyperclip = type('PyperclipAlternative', (), {'copy': staticmethod(macos_copy_clipboard)})
+            has_pyperclip = True
+            logger.info("已启用macOS系统剪贴板支持")
+        except Exception as e:
+            logger.error(f"初始化macOS剪贴板失败: {e}")
+    
+    elif platform.system() == 'Linux':
+        try:
+            import subprocess
+            
+            def xclip_available():
+                try:
+                    subprocess.check_call(['which', 'xclip'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    return True
+                except:
+                    return False
+            
+            def xsel_available():
+                try:
+                    subprocess.check_call(['which', 'xsel'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    return True
+                except:
+                    return False
+            
+            def linux_copy_clipboard(text):
+                if xclip_available():
+                    process = subprocess.Popen(
+                        ['xclip', '-selection', 'clipboard'],
+                        stdin=subprocess.PIPE, 
+                        close_fds=True
+                    )
+                    process.communicate(input=text.encode('utf-8'))
+                elif xsel_available():
+                    process = subprocess.Popen(
+                        ['xsel', '-b', '-i'],
+                        stdin=subprocess.PIPE, 
+                        close_fds=True
+                    )
+                    process.communicate(input=text.encode('utf-8'))
+                else:
+                    raise Exception("未找到xclip或xsel命令")
+            
+            if xclip_available() or xsel_available():
+                pyperclip = type('PyperclipAlternative', (), {'copy': staticmethod(linux_copy_clipboard)})
+                has_pyperclip = True
+                logger.info("已启用Linux系统剪贴板支持")
+        except Exception as e:
+            logger.error(f"初始化Linux剪贴板失败: {e}")
 
 
 class ManageTab(ttk.Frame):
@@ -49,6 +145,8 @@ class ManageTab(ttk.Frame):
         tree.column('序号', width=40, stretch=False)
 
         tree.bind('<<TreeviewSelect>>', self.on_select)
+        # 添加双击事件处理
+        tree.bind('<Double-1>', self.on_double_click)
 
         scrollbar = ttk.Scrollbar(accounts_frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
@@ -82,9 +180,177 @@ class ManageTab(ttk.Frame):
                   style='Custom.TButton', width=10).pack(side=tk.LEFT, padx=PADDING['MEDIUM'])
         ttk.Button(second_row_frame, text="删除账号", command=self.delete_account, 
                   style='Custom.TButton', width=10).pack(side=tk.LEFT, padx=PADDING['MEDIUM'])
+        
+        # 添加复制账号和密码按钮
+        ttk.Button(second_row_frame, text="复制账号", command=self.copy_email, 
+                  style='Custom.TButton', width=10).pack(side=tk.LEFT, padx=PADDING['MEDIUM'])
+        ttk.Button(second_row_frame, text="复制密码", command=self.copy_password, 
+                  style='Custom.TButton', width=10).pack(side=tk.LEFT, padx=PADDING['MEDIUM'])
 
         self.account_tree = tree
         self.selected_item = None
+
+    # 复制到剪贴板通用方法
+    def copy_to_clipboard(self, text: str, success_msg: str) -> None:
+        if not has_pyperclip:
+            UI.show_warning(self.winfo_toplevel(), "复制功能不可用，请安装pyperclip模块\n命令: pip install pyperclip")
+            return
+            
+        try:
+            pyperclip.copy(text)
+            logger.info(f"已复制到剪贴板: {text}")
+            UI.show_success(self.winfo_toplevel(), success_msg)
+        except Exception as e:
+            UI.show_error(self.winfo_toplevel(), "复制失败", e)
+            logger.error(f"复制到剪贴板失败: {str(e)}")
+    
+    # 复制邮箱账号
+    def copy_email(self) -> None:
+        try:
+            csv_file_path, account_data = self.get_selected_account()
+            email = account_data.get('EMAIL', '')
+            if not email:
+                raise ValueError("所选账号没有邮箱信息")
+                
+            self.copy_to_clipboard(email, f"已复制邮箱: {email}")
+        except Exception as e:
+            UI.show_error(self.winfo_toplevel(), "复制邮箱失败", e)
+            logger.error(f"复制邮箱失败: {str(e)}")
+    
+    # 复制密码
+    def copy_password(self) -> None:
+        try:
+            csv_file_path, account_data = self.get_selected_account()
+            password = account_data.get('PASSWORD', '')
+            if not password:
+                raise ValueError("所选账号没有密码信息")
+                
+            self.copy_to_clipboard(password, f"已复制密码")
+        except Exception as e:
+            UI.show_error(self.winfo_toplevel(), "复制密码失败", e)
+            logger.error(f"复制密码失败: {str(e)}")
+
+    # 处理双击事件，显示账号详细信息
+    def on_double_click(self, event):
+        try:
+            if not self.selected_item:
+                return
+                
+            csv_file_path, account_data = self.get_selected_account()
+            email = account_data.get('EMAIL', '未知')
+            password = account_data.get('PASSWORD', '未知')
+            domain = account_data.get('DOMAIN', '未知')
+            quota = account_data.get('QUOTA', '未知')
+            days = account_data.get('DAYS', '未知')
+            
+            # 创建详细信息对话框
+            detail_dialog = tk.Toplevel(self.winfo_toplevel())
+            detail_dialog.title("账号详细信息")
+            detail_dialog.transient(self.winfo_toplevel())
+            detail_dialog.grab_set()
+            detail_dialog.configure(bg=UI.COLORS['bg'])
+            
+            # 计算对话框大小和位置
+            dialog_width = 450
+            dialog_height = 300
+            UI.center_window(detail_dialog, dialog_width, dialog_height)
+            detail_dialog.resizable(False, False)
+            
+            # 创建内容框架
+            content_frame = ttk.Frame(detail_dialog, style='TFrame', padding=10)
+            content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            # 账号信息标签
+            ttk.Label(content_frame, text="账号信息", style='Title.TLabel').pack(pady=(0, 10))
+            
+            # 创建表格式布局显示账号信息
+            info_frame = ttk.Frame(content_frame, style='TFrame')
+            info_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+            
+            # 域名信息行
+            domain_frame = ttk.Frame(info_frame, style='TFrame')
+            domain_frame.pack(fill=tk.X, pady=3)
+            ttk.Label(domain_frame, text="域名:", width=10, anchor=tk.E).pack(side=tk.LEFT, padx=(0, 5))
+            domain_label = ttk.Label(domain_frame, text=domain)
+            domain_label.pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
+            ttk.Button(domain_frame, text="复制", width=6, command=lambda: self.copy_to_clipboard(domain, "已复制域名")).pack(side=tk.RIGHT)
+            
+            # 邮箱信息行
+            email_frame = ttk.Frame(info_frame, style='TFrame')
+            email_frame.pack(fill=tk.X, pady=3)
+            ttk.Label(email_frame, text="邮箱:", width=10, anchor=tk.E).pack(side=tk.LEFT, padx=(0, 5))
+            email_label = ttk.Label(email_frame, text=email)
+            email_label.pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
+            ttk.Button(email_frame, text="复制", width=6, command=lambda: self.copy_to_clipboard(email, "已复制邮箱")).pack(side=tk.RIGHT)
+            
+            # 密码信息行
+            password_frame = ttk.Frame(info_frame, style='TFrame')
+            password_frame.pack(fill=tk.X, pady=3)
+            ttk.Label(password_frame, text="密码:", width=10, anchor=tk.E).pack(side=tk.LEFT, padx=(0, 5))
+            password_var = tk.StringVar(value="●●●●●●●●")
+            password_label = ttk.Label(password_frame, textvariable=password_var)
+            password_label.pack(side=tk.LEFT, padx=(0, 5), fill=tk.X, expand=True)
+            
+            # 添加密码显示切换和复制按钮
+            password_buttons_frame = ttk.Frame(password_frame, style='TFrame')
+            password_buttons_frame.pack(side=tk.RIGHT)
+            
+            # 显示/隐藏密码的变量和函数
+            show_password = tk.BooleanVar(value=False)
+            
+            def toggle_password():
+                if show_password.get():
+                    password_var.set(password)
+                else:
+                    password_var.set("●●●●●●●●")
+            
+            # 密码显示切换按钮
+            show_password_check = ttk.Checkbutton(
+                password_buttons_frame, 
+                text="显示", 
+                variable=show_password, 
+                command=toggle_password
+            )
+            show_password_check.pack(side=tk.LEFT, padx=(0, 5))
+            
+            # 复制密码按钮
+            ttk.Button(
+                password_buttons_frame, 
+                text="复制", 
+                width=6, 
+                command=lambda: self.copy_to_clipboard(password, "已复制密码")
+            ).pack(side=tk.LEFT)
+            
+            # 额度信息行
+            quota_frame = ttk.Frame(info_frame, style='TFrame')
+            quota_frame.pack(fill=tk.X, pady=3)
+            ttk.Label(quota_frame, text="额度:", width=10, anchor=tk.E).pack(side=tk.LEFT, padx=(0, 5))
+            quota_label = ttk.Label(quota_frame, text=quota)
+            quota_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            
+            # 剩余天数信息行
+            days_frame = ttk.Frame(info_frame, style='TFrame')
+            days_frame.pack(fill=tk.X, pady=3)
+            ttk.Label(days_frame, text="剩余天数:", width=10, anchor=tk.E).pack(side=tk.LEFT, padx=(0, 5))
+            days_label = ttk.Label(days_frame, text=days)
+            days_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            
+            # 底部按钮区域
+            button_frame = ttk.Frame(content_frame, style='TFrame')
+            button_frame.pack(fill=tk.X, pady=(10, 0))
+            
+            # 关闭按钮
+            ttk.Button(
+                button_frame, 
+                text="关闭", 
+                style='Custom.TButton',
+                width=10, 
+                command=detail_dialog.destroy
+            ).pack(side=tk.RIGHT, padx=5)
+            
+        except Exception as e:
+            UI.show_error(self.winfo_toplevel(), "显示账号详情失败", e)
+            logger.error(f"显示账号详情失败: {str(e)}")
 
     def on_select(self, event):
         selected_items = self.account_tree.selection()

@@ -7,6 +7,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
+    datas=[('assets/shili.ico', 'assets')],
     hiddenimports=[
         'tkinter', 
         'PIL._tkinter_finder',
@@ -77,7 +78,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon='assets/shili.ico',
     uac_admin=False,
 )
 
